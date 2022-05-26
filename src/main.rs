@@ -1,12 +1,24 @@
 mod db;
 mod util;
+mod analysis;
 
+mod prelude {
+	pub use std::path::PathBuf;
+	pub use crate::db::DbHandler;
+	pub use crate::util::*;
+	pub use crate::analysis::*;
+	pub use std::collections::HashMap;
+	pub use time::Date;
+	pub use anyhow::{Result, anyhow};
+}
+
+use prelude::*;
+use core::f64;
+use std::{io, fs, os};
+// use std::;
 // use trendar;
 use clap::{Parser, Subcommand};
-use std::{io, path::PathBuf};
-
-use crate::db::DbHandler;
-use crate::util::*;
+use dirs;
 
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
@@ -42,12 +54,11 @@ fn main() {
 					Some(s) => println!("Toggling the {} state.", s),
 					None => println!("Listing all states in database"),
     			},
-				Commands::Analyze => println!("Performing analysis..."),
+				Commands::Analyze => analyze_db(),
 			}
 		},
-    	None => println!("Entering data"),
+    	None => insert_entry(),
 	}
-	
 }
 
 fn init(database: &Option<String>) {
@@ -61,7 +72,39 @@ fn init(database: &Option<String>) {
 			Err(e) => println!("Something went wrong! {}", e),
 		}
 	}
-	// println!("Detecting where the config file is.");
+
+	// let mut config_dir = if cfg!(windows) {
+	// 	PathBuf::from("~\\Documents\\mood\\")
+	// } else {
+	// 	PathBuf::from("~/.config/mood/")
+	// };
+	let config_dir = dirs::config_dir();
+	if let Some(mut path) = config_dir {
+		path.push("mood");
+		if !path.exists() {
+			if fs::create_dir_all(&path).is_ok() {
+				path.push("config.toml");
+				create_config(&path);
+			} else {
+				println!("Error occurred when creating config directory.");
+				return
+			}
+		}
+	} else {
+		println!("Error occurred when retrieving user directory.");
+		return
+	}
+
+	let mut db_dir = dirs::config_dir().unwrap();
+	db_dir.push("mood");
+	db_dir.push("mood.db");
+
+	// TODO: Give option for changing DB location
+	let dbh = if !db_dir.exists() {
+		DbHandler::initialize_db(db_dir).unwrap()
+	} else {
+		DbHandler::new(db_dir)
+	};
 	// println!("Config file will be stored at {config_directory}. Please enter where you'd like the database to be stored [{config_directory}]:");
 
 	let mut fields = Vec::new();
@@ -74,6 +117,7 @@ fn init(database: &Option<String>) {
 		if field_name.trim().is_empty() {
 			break
 		}
+		field_name = field_name.replace(" ", "_");
 
 		let category = select_category();
 		let field_type = select_type();
@@ -85,16 +129,25 @@ fn init(database: &Option<String>) {
 		io::stdin().read_line(&mut confirm).expect("Invalid input received");
 		if confirm.trim().is_empty() || confirm.trim().to_lowercase() == String::from("y") {
 			fields.push(
-				(
-					String::from(field_name.trim()), 
+				Field {
+					name: String::from(field_name.trim()),
 					category, 
-					field_type,
-				)
+					data_type: field_type,
+					active: true,
+				}
 			);
 		}
 	}
 	println!("Fields added are as below:");
 	println!("{:#?}", fields);
+	for field in fields {
+		let _ = dbh.insert_field(&field);
+	}
+}
+
+fn create_config(_config_directory: &PathBuf) {
+	println!("This is where the config would be created!");
+    // todo!()
 }
 
 fn select_category() -> FieldCategory {
@@ -141,109 +194,104 @@ fn select_type() -> FieldType {
 // 	// println!("{:?}", source.sub(dest));
 // }
 
-// fn test() {
-// 	let path = "D:\\Programs\\mood\\test1.db";
-// 		let dbh = DbHandler::initialize_db(PathBuf::from(path)).unwrap();
-// 		let field = Field {
-// 			name: String::from("mood"),
-// 			category: crate::util::FieldCategory::Output,
-// 			data_type: crate::util::FieldType::Numeric,
-// 			active: true,
-// 		};
-		
-// 		let a = dbh.insert_field(field.clone());
-// 		let vf = dbh.get_fields().unwrap();
-// 		// assert!(vf.len() == 1);
-// 		// assert!(field.eq(vf.get(0).unwrap()));
-// }
+fn insert_entry() {
+	//TODO: Grab location from config file.
+	let mut db_dir = dirs::config_dir().unwrap();
+	db_dir.push("mood");
+	db_dir.push("mood.db");
+
+	let dbh = DbHandler::new(db_dir);
+	let fields = dbh.get_fields().unwrap();
+	let mut num_hm = HashMap::new();
+	let mut bool_hm = HashMap::new();
+	let mut tags = Vec::new();
+	let date = Date::from(time::OffsetDateTime::now_utc().date());
+	println!("Entering data for today, {}.", date);
+	println!("If you do not wish to enter data, leave the field blank.");
+	for field in fields {
+		// println!("Back in the loop");
+		match field.data_type {
+			FieldType::Numeric => {
+				let data = get_numeric_data(&field.name);
+				if let Some(data) = data {
+					num_hm.insert(field.name, data);
+				}
+			},
+			FieldType::Boolean => {
+				let data = get_boolean_data(&field.name);
+				if let Some(data) = data {
+					bool_hm.insert(field.name, data);
+				}
+			},
+			FieldType::Text => {
+				let mut data = String::new();
+				println!("Please write down any notable tags for the day, separated by spaces.");
+				io::stdin().read_line(&mut data).expect("Invalid input received");
+				tags = data
+					.split_ascii_whitespace()
+					.filter(|s| s.len() > 0)
+					.map(|s| String::from(s))
+					.collect();
+				// println!("{:?}", tags);
+			},
+		}
+	}
+
+	let entry = Entry {
+		date,
+		numeric_fields: num_hm,
+		boolean_fields: bool_hm,
+		tags,
+	};
+
+	match dbh.insert_entry(&entry) {
+		Ok(_) => println!("Entry added to database."),
+		Err(e) => println!("Error occurred: {}", e),
+	}
+}
+
+fn get_boolean_data(name: &str) -> Option<bool> {
+	let mut data = String::new();
+	loop {
+		print!("Did {} occur today [y/n]: ", name);
+		io::Write::flush(&mut io::stdout()).expect("flush failed!");
+		io::stdin().read_line(&mut data).expect("Invalid input received");
+		match data.to_ascii_lowercase().trim() {
+			"y" => return Some(true),
+			"n" => return Some(false),
+			_ => return None,
+		}
+	}
+}
+
+fn get_numeric_data(name: &str) -> Option<f64> {
+	let mut data = String::new();
+	loop {
+		print!("How would you report the value of {}: ", name);
+		io::Write::flush(&mut io::stdout()).expect("flush failed!");
+		io::stdin().read_line(&mut data).expect("Invalid input received");
+		// if f64::from(data)
+		if data.trim().len() == 0 {
+			return None;
+		}
+		let num = data.trim().parse::<f64>();
+		if num.is_ok() {
+			return Some(num.unwrap())
+		} else {
+			println!("\nData given was not a valid number.")
+		}
+	}
+}
+
+fn analyze_db() {
+	println!("Performing analysis...");
+	analyze(PathBuf::from("not a real path"));
+}
 
 #[cfg(test)]
 mod main_tests {
-	use std::collections::HashMap;
-
-use crate::{db::{db_tests::setup_db, DbHandler}, util::{FieldCategory, FieldType, Field, Entry}};
-	use csv::Reader;
-	use time::Date;
-
-	fn import_csv(dbh: &DbHandler, file: &str) {
-		let mut reader = Reader::from_path(file).unwrap();
-		let headers = reader.headers().unwrap();
-		let mut header_cols = Vec::new();
-		let mut fields = Vec::new();
-		for record in headers {
-			header_cols.push(String::from(&record[2..]));
-			if record == "date" || record == "tags" {
-				continue;
-			}
-			let category = match &record[0..1] {
-				"I" => FieldCategory::Input,
-				"O" => FieldCategory::Output,
-				_ => FieldCategory::Hybrid,
-			};
-			let data_type = match &record[1..2] {
-				"N" => FieldType::Numeric,
-				"B" => FieldType::Boolean,
-				_ => FieldType::Text
-			};
-
-			let field = Field {
-				name: String::from(&record[2..]),
-				category,
-				data_type,
-				active: true,
-			};
-			let _ = dbh.insert_field(&field);
-			fields.push(field);
-		}
-
-		let field = Field {
-			name: String::from("tags"),
-			category: FieldCategory::Input,
-			data_type: FieldType::Text,
-			active: true,
-		};
-		// let _ = dbh.insert_field(&field);
-		fields.push(field);
-		// println!("{:#?}", fields);
-
-		for record in reader.records() {
-			println!("Beginning row parsing");
-			let record = record.unwrap();
-			let mut date = None;
-			let mut i = 0;
-			let mut numeric_fields = HashMap::new();
-			let mut boolean_fields = HashMap::new();
-			let mut tags = Vec::new();
-
-			for a in &record {
-				// println!("{}", a);
-				if i == 0 {
-					let n: i32 = a.parse().unwrap();
-					date = Some(Date::from_julian_day(n).unwrap());
-				} else {
-					let field = fields.get(i-1).unwrap();
-					match field.data_type {
-						FieldType::Numeric => { numeric_fields.insert(field.name.clone(), a.parse().unwrap()); },
-						FieldType::Boolean => { boolean_fields.insert(field.name.clone(), a.parse().unwrap()); },
-						FieldType::Text => { tags = a.split(" ").map(|s| String::from(s)).collect(); },
-					}
-				}
-				// record.unwrap()
-				i += 1;
-			}
-
-			let entry = Entry {
-				date: date.unwrap(),
-				numeric_fields,
-				boolean_fields,
-				tags,
-			};
-			let a = dbh.insert_entry(&entry);
-			if let Err(message) = a {
-				println!("Error occurred: {}", message);
-			}
-		}
-	}
+	use super::*;
+	use crate::util::test_utils::*;
 
 	#[test]
 	fn import_test() {
@@ -272,6 +320,5 @@ use crate::{db::{db_tests::setup_db, DbHandler}, util::{FieldCategory, FieldType
 		};
 
 		assert!(entries.pop().unwrap() == entry)
-
 	}
 }

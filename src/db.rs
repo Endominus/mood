@@ -23,8 +23,14 @@ impl DbHandler {
 		commands.insert("insert field entry", "INSERT INTO fields (name, category, type, active) VALUES (':name', ':category', ':type', true);");
 		commands.insert("insert entry", "INSERT INTO entries (date, ENTRY_COLUMNS) VALUES (ENTRY_VALUES);");
 		commands.insert("get fields", "SELECT name, category, type, active FROM fields;");
-		commands.insert("get active fields", "SELECT name, category, type, active FROM fields WHERE active = true;");
+		commands.insert("get active fields", "SELECT name, category, type, active FROM fields WHERE active = true ORDER BY type ASC;");
 		commands.insert("get entries", "SELECT date, ENTRY_COLUMNS, tags FROM entries;");
+		commands.insert("get numeric field entries", "SELECT :column FROM entries WHERE date >= :start AND date <= :end ORDER BY date ASC;");
+		commands.insert("get dates and numeric field entries", "SELECT date, :column FROM entries ORDER BY date ASC;");
+		commands.insert("get dates and numeric field entries between dates", "SELECT date, :column FROM entries WHERE date >= :start AND date <= :end ORDER BY date ASC;");
+		commands.insert("get latest date", "SELECT MAX(date) FROM entries;");
+		commands.insert("get earliest date", "SELECT MIN(date) FROM entries;");
+		commands.insert("count entries", "SELECT COUNT (*) FROM entries WHERE :column NOT NULL AND date >= :start AND date <= :end;");
 
 		Self {
     		conn,
@@ -62,7 +68,7 @@ impl DbHandler {
 						type text not null,
 						output text not null,
 						input text not null,
-						confidence float not null,
+						confidence real not null,
 						hidden bool not null
 					)",
 					[],
@@ -72,14 +78,14 @@ impl DbHandler {
 					"create table if not exists states (
 						id integer primary key,
 						name text not null,
-						amount float,
+						amount real,
 						start_date text not null,
 						end_date text
 					)", 
 					[],
 				)?;
 
-				conn.execute("INSERT INTO fields (name, category, type, active) VALUES ('tags', 'input', 'text', true);", [])?;
+				conn.execute("INSERT INTO fields (name, category, type, active) VALUES ('tags', 'i', 't', true);", [])?;
 			},
 			Err(err) => {
 				println!("Error occurred when trying to create a database.");
@@ -94,7 +100,7 @@ impl DbHandler {
 
 	pub fn insert_field(&self, field: &Field) -> Result<()> {
 		let (type_full, type_short) = match field.data_type {
-			FieldType::Numeric => ("float", "n"),
+			FieldType::Numeric => ("real", "n"),
 			FieldType::Boolean => ("boolean", "b"),
 			FieldType::Text => ("text", "t"),
 		};
@@ -123,15 +129,13 @@ impl DbHandler {
 		let fields = stmt.query_map([], |row| {
 			let c1: String = row.get(1)?;
 			let category = match c1.as_str() {
-				"i" => FieldCategory::Input,
-				"o" => FieldCategory::Output,
 				"h" => FieldCategory::Hybrid,
-				_ => FieldCategory::Input
+				"o" => FieldCategory::Output,
+				_ => FieldCategory::Input,
 			};
 
 			let c2: String = row.get(2)?;
 			let data_type = match c2.as_str() {
-				"t" => FieldType::Text,
 				"n" => FieldType::Numeric,
 				"b" => FieldType::Boolean,
 				_ => FieldType::Text,
@@ -161,12 +165,12 @@ impl DbHandler {
 			let mut boolean_fields = HashMap::new();
 			let mut tags = Vec::new();
 
-			println!("Before the loop");
+			// println!("Before the loop");
 			let date: i32 = row.get(i)?;
 			i += 1;
 			while i < 1+field_columns.len() {
 				let field = fields.get(i-1).unwrap();
-				println!("Loop iteration {}, looking at field {}", i, field.name);				
+				// println!("Loop iteration {}, looking at field {}", i, field.name);				
 				match field.data_type {
 					FieldType::Numeric => {
 						let val: f64 = row.get(i)?;
@@ -195,13 +199,38 @@ impl DbHandler {
 		entries.collect()
 	}
 
+	pub fn get_numeric_values(&self, field: &String) -> Result<Vec<(u32, f64)>> {
+		let s = self.commands.get("get dates and numeric field entries").unwrap();
+		let s = s.replace(":column", field);
+
+		let mut statement = self.conn.prepare(&s).unwrap();
+		let a = statement
+			.query_map([], 
+			|row| Ok((row.get(0).unwrap(), row.get(1).unwrap())))? //We're writing Lisp code now!
+			.map(|v| v.unwrap()).collect();
+		Ok(a)
+	}
+
+	pub fn get_numeric_values_between_dates(&self, field: &String, start: u32, end: u32) -> Result<Vec<(u32, f64)>> {
+		let s = self.commands.get("get dates and numeric field entries between dates").unwrap();
+		let s = s.replace(":column", field);
+		
+		let mut statement = self.conn.prepare(&s).unwrap();
+		let a = statement
+			.query_map(&[(":start", &start.to_string()), (":end", &end.to_string())], 
+			|row| Ok((row.get(0).unwrap(), row.get(1).unwrap())))? //We're writing Lisp code now!
+			.map(|v| v.unwrap()).collect();
+		// let a = s.mapped(|row| Ok((row.get(0).unwrap(), row.get(1).unwrap()))).map(|v| v.unwrap()).collect();
+		Ok(a)
+	}
+
 	pub fn insert_entry(&self, entry: &Entry) -> Result<usize, Error> {
-		println!("Inserting row");
+		// println!("Inserting row");
 		let ie = self.commands.get("insert entry").unwrap();
 		let mut cols = String::new();
 		let mut values = format!("{}, ", entry.date.to_julian_day());
 		for (key, value) in &entry.boolean_fields {
-			cols.push_str(format!("{}, ", key).as_str());
+			cols.push_str(format!("'{}', ", key).as_str());
 			values.push_str(format!("{}, ", value).as_str());
 		}
 		for (key, value) in &entry.numeric_fields {
@@ -212,30 +241,36 @@ impl DbHandler {
 		values.push_str(format!("'{}'", entry.tags.join(" ")).as_str());
 
 		let ie = ie.replace("ENTRY_COLUMNS", cols.as_str()).replace("ENTRY_VALUES", values.as_str());
-		println!("Inserting row: {}", ie);
+		// println!("Inserting row: {}", ie);
 		self.conn.execute(&ie, [])
+	}
+
+	pub fn get_range(&self) -> (u32, u32) {
+		let first = self.conn.query_row(
+			self.commands.get("get earliest date").unwrap(), 
+			[],
+		|row| row.get(0)).unwrap();
+		let last = self.conn.query_row(
+			self.commands.get("get latest date").unwrap(), 
+			[],
+		|row| row.get(0)).unwrap();
+		(first, last)
+	}
+
+	pub fn count_entries(&self, field: &String, start: u32, end: u32) -> Result<u32, Error> {
+		Ok(self.conn.query_row(
+			self.commands.get("count entries").unwrap(), 
+			&[(":column", field), (":start", &start.to_string()), (":end", &end.to_string())],
+		| row | row.get(0))?)
 	}
 
 }
 
 #[cfg(test)]
 pub mod db_tests {
-    use std::{path::PathBuf, collections::HashMap};
-	use std::fs;
-    use time::{Date, Month};
-    use crate::{db::DbHandler, util::*};
-
-	pub fn setup_db(file: &str) -> DbHandler {
-		// let p = format!("D:\\Programs\\mood\\{}.db", file);
-        let path = PathBuf::from(file);
-		if path.exists() {
-			let _ = fs::remove_file(&path);
-		}
-
-		let dbh = DbHandler::initialize_db(PathBuf::from(path)).unwrap();
-
-		dbh
-	}
+	use super::*;
+	use time::Month;
+	use crate::util::test_utils::*;
 
     #[test]
     fn field_creation() {
@@ -270,7 +305,7 @@ pub mod db_tests {
 		assert!(result.unwrap() == 1);
 
 		let returned = dbh.get_entries();
-		println!("{:?}", returned);
+		// println!("{:?}", returned);
 		assert!(returned.is_ok());
 		assert!(returned.unwrap().pop().unwrap() == entry);
 	}
