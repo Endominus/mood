@@ -10,6 +10,7 @@ mod prelude {
 	pub use std::collections::HashMap;
 	pub use time::Date;
 	pub use anyhow::{Result, anyhow};
+	pub use dirs;
 }
 
 use prelude::*;
@@ -18,7 +19,6 @@ use std::{io, fs, os};
 // use std::;
 // use trendar;
 use clap::{Parser, Subcommand};
-use dirs;
 
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
